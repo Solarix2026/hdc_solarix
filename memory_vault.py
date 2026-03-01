@@ -101,11 +101,12 @@ class MemoryVault:
         return results
 
     def retrieve_by_similarity(
-        self, hv: np.ndarray, top_k: int = 3, threshold: float = 0.7, hdc_core=None
+        self, hv: np.ndarray, top_k: int = 3, threshold: float = 0.7, hdc_core=None, exclude_recent_seconds: int = 3600
     ):
         """
         使用 HDCCore 在记忆库中进行相似度检索（KNN 匹配）。
         """
+        import time
         # 为了兼容，如果没传 hdc_core 参数，自动实例化一个HDCCore来进行计算
         if hdc_core is None:
             from hdc_core import HDCCore
@@ -113,8 +114,13 @@ class MemoryVault:
             
         all_memories = self.retrieve_all()
         scored_results = []
+        current_time = time.time()
 
         for mem_id, ts, text, hv_array, source, solution, is_cons in all_memories:
+            # 【關鍵修補】：過濾掉最近 1 小時內剛剛存入的記憶，防止自我復讀（無限回音）
+            if current_time - ts < exclude_recent_seconds:
+                continue
+
             if is_cons == 1:
                 # 已折叠的可以被检索，但是暂时不强制过滤
                 pass
@@ -126,7 +132,7 @@ class MemoryVault:
                     "similarity_score": score,
                     "timestamp": ts,
                     "context": text,
-                    "solution": solution if solution else "",
+                    "solution": solution if solution else "无明确解决方案记录",
                     "solution_path": "", # 预留字段
                     "id": mem_id
                 })
