@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from hdc_core import HDCCore
 from lsh_mapper import LSHMapper
-from qwen_embedder import get_embedding
+from hdc_coder import HDCCoder
 
 
 def main():
@@ -19,7 +19,7 @@ def main():
 
     # 1. 初始化核心组件
     print("\n[1] 初始化核心组件...")
-    mapper = LSHMapper(input_dim=896, output_dim=10000, seed=42)
+    coder = HDCCoder()
     hdc = HDCCore(dimension=10000)
 
     # 2. 构建记忆库（Encoding）
@@ -38,8 +38,7 @@ def main():
 
     print(f"\n[2] 正在批量存入 {len(texts)} 条记忆（这可能需要一些时间）...")
     for i, text in enumerate(texts, 1):
-        float_vec = get_embedding(text)
-        hypervector = mapper.map(float_vec)
+        hypervector = coder.encode(text)
         memory_items.append((text, hypervector))
         
         # 进度提示
@@ -50,8 +49,7 @@ def main():
     query_text = "What is Solarix's memory technology?"
     print(f"\n[3] 接收查询: '{query_text}'...")
 
-    query_float_vec = get_embedding(query_text)
-    query_hv = mapper.map(query_float_vec)
+    query_hv = coder.encode(query_text)
 
     # 计算相似度并加入列表
     results = []
