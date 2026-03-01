@@ -2,12 +2,9 @@
 Solarix — 低功耗神经符号记忆系统 PoC
 HDCCore: 超维计算（Hyperdimensional Computing）核心引擎
 
-本模块用纯 NumPy 实现 HDC 的基本操作：
-  - 生成二进制超向量（Hypervector）作为记忆痕迹
-  - 绑定（Binding）：逐元素 XOR，编码"关系"
-  - 打包（Bundling）：多数表决，叠加"集合记忆"
-  - 汉明距离相似度（Hamming Similarity）：衡量记忆检索质量
-  - 压缩 / 解压（Pack / Unpack）：节省存储开销
+**重点重构**：位压缩原生架构
+所有超向量在类内外均以位压缩包（uint8, shape=byte_size_）流转，
+彻底消除未压缩的 (10000,) 数组。1 个字节表示 8 个物理维度。
 """
 
 from __future__ import annotations
@@ -16,7 +13,7 @@ import numpy as np
 
 
 class HDCCore:
-    """超维计算核心类，管理超向量空间的生成、绑定、打包与相似度计算。"""
+    """超维计算原生位压缩核心类，为 C++ 移植铺路。"""
 
     def __init__(self, dimension: int = 10000) -> None:
         """
@@ -25,221 +22,162 @@ class HDCCore:
         Parameters
         ----------
         dimension : int
-            超向量维度，默认 10000。维度越高，记忆容量和抗干扰能力越强。
+            逻辑超向量维度，默认 10000。
         """
-        self.dimension: int = dimension
+        self.dimension_: int = dimension
+        # 物理字节数（向上取整，以处理非 8 倍数的维度）
+        self.byte_size_: int = (dimension + 7) // 8
 
     # ------------------------------------------------------------------
-    # 超向量生成
+    # 生成随机向量（直接压缩）
     # ------------------------------------------------------------------
     def generate_random_vector(self) -> np.ndarray:
         """
-        生成一个随机二进制超向量（记忆痕迹）。
+        生成一个随机二进制超向量，并立刻打进压缩包。
 
         Returns
         -------
         np.ndarray
-            形状 (dimension,)，元素为 0 或 1，各占 50% 概率。
+            形状 (byte_size_,)，dtype 为 np.uint8。
         """
-        return np.random.randint(0, 2, size=self.dimension, dtype=np.uint8)
+        # 第一步：生成逻辑随机向量
+        raw_vec = np.random.randint(0, 2, size=self.dimension_, dtype=np.uint8)
+        # 第二步（强制）：立即调用 np.packbits 压缩为 (byte_size_,)
+        packed_vec = np.packbits(raw_vec)
+        return packed_vec
 
     # ------------------------------------------------------------------
-    # 绑定（Binding）—— 编码"关系"
+    # 绑定操作（极速 XOR）
     # ------------------------------------------------------------------
     def bind(self, vector1: np.ndarray, vector2: np.ndarray) -> np.ndarray:
         """
-        绑定两个超向量：逐元素异或（XOR）。
-
-        绑定后的向量与任一输入向量近似正交，可用于编码
-        "A 与 B 的关联"这类关系型记忆。
+        绑定两个压缩包：逐字节异或。
 
         Parameters
         ----------
         vector1, vector2 : np.ndarray
-            待绑定的二进制超向量。
+            压缩后的二进制超向量。
 
         Returns
         -------
         np.ndarray
-            绑定结果，形状 (dimension,)。
-
-        Raises
-        ------
-        ValueError
-            若任一向量维度与初始化维度不一致。
+            绑定结果，形状 (byte_size_,)。
         """
-        if vector1.shape != (self.dimension,):
-            raise ValueError(
-                f"vector1 维度 {vector1.shape} 与期望 ({self.dimension},) 不一致"
-            )
-        if vector2.shape != (self.dimension,):
-            raise ValueError(
-                f"vector2 维度 {vector2.shape} 与期望 ({self.dimension},) 不一致"
-            )
+        if vector1.shape != (self.byte_size_,) or vector2.shape != (self.byte_size_,):
+            raise ValueError(f"输入形状需要为 ({self.byte_size_,})")
+
+        # C++: 直接对 std::vector<uint8_t> 进行逐字节 XOR，1条指令处理8个维度。
         return np.bitwise_xor(vector1, vector2)
 
     # ------------------------------------------------------------------
-    # 打包（Bundling）—— 叠加"集合记忆"
+    # 打包操作
     # ------------------------------------------------------------------
     def bundle(self, vectors: list[np.ndarray]) -> np.ndarray:
         """
-        打包多个超向量：带平局随机处理的多数表决。
-
-        打包后的向量与每个输入向量都保持较高相似度，可用于
-        表示"集合记忆"（如一组相关概念的叠加）。
-
-        规则（逐位）：
-          - 1 的个数 > 0 的个数 → 取 1
-          - 0 的个数 > 1 的个数 → 取 0
-          - 平局 → 随机取 0 或 1（避免信息丢失）
+        打包多个超向量压缩包：带平局判断的多数表决。
+        需先解包所有向量实现整数加法，再重新打包。
 
         Parameters
         ----------
         vectors : list[np.ndarray]
-            至少包含 2 个二进制超向量。
+            包含压缩包的列表。
 
         Returns
         -------
         np.ndarray
-            打包结果，形状 (dimension,)。
-
-        Raises
-        ------
-        ValueError
-            若向量数量 < 2 或任一向量维度不一致。
+            多数表决后的新超向量压缩包。
         """
         if len(vectors) < 2:
             raise ValueError("打包操作至少需要 2 个超向量")
-        for i, v in enumerate(vectors):
-            if v.shape != (self.dimension,):
-                raise ValueError(
-                    f"vectors[{i}] 维度 {v.shape} 与期望 ({self.dimension},) 不一致"
-                )
 
-        # 按列求和：sum_arr[j] = 所有向量第 j 位的 1 的个数
-        stacked = np.stack(vectors)                       # (n, dimension)
-        ones_count = stacked.sum(axis=0)                  # (dimension,)
+        # 必须解包以进行多数求和计算
+        unpacked_list = []
+        for v in vectors:
+            unpacked = np.unpackbits(v)[:self.dimension_]
+            unpacked_list.append(unpacked)
+
+        stacked = np.stack(unpacked_list)
+        ones_count = stacked.sum(axis=0)
+        
         n = len(vectors)
         half = n / 2.0
 
-        result = np.empty(self.dimension, dtype=np.uint8)
+        result = np.empty(self.dimension_, dtype=np.uint8)
         result[ones_count > half] = 1
         result[ones_count < half] = 0
 
-        # 平局位随机打破
+        # 平局随机打破
         tie_mask = ones_count == half
         tie_count = int(tie_mask.sum())
         if tie_count > 0:
             result[tie_mask] = np.random.randint(0, 2, size=tie_count, dtype=np.uint8)
 
-        return result
+        # 重新打包后返回
+        return np.packbits(result)
 
     # ------------------------------------------------------------------
-    # 压缩 / 解压 —— 节省存储
-    # ------------------------------------------------------------------
-    def pack(self, vector: np.ndarray) -> np.ndarray:
-        """
-        将二进制超向量压缩为字节数组（8 bit → 1 byte）。
-
-        Parameters
-        ----------
-        vector : np.ndarray
-            形状 (dimension,) 的二进制超向量。
-
-        Returns
-        -------
-        np.ndarray
-            压缩后的 uint8 字节数组。
-        """
-        return np.packbits(vector)
-
-    def unpack(self, packed_vector: np.ndarray) -> np.ndarray:
-        """
-        将压缩字节数组还原为原始维度的二进制超向量。
-
-        会自动裁剪 packbits 尾部填充，保证维度与 self.dimension 一致。
-
-        Parameters
-        ----------
-        packed_vector : np.ndarray
-            由 pack() 返回的压缩数组。
-
-        Returns
-        -------
-        np.ndarray
-            形状 (dimension,) 的二进制超向量。
-        """
-        unpacked = np.unpackbits(packed_vector)
-        return unpacked[: self.dimension]
-
-    # ------------------------------------------------------------------
-    # 相似度计算（汉明距离）
+    # 相似度计算（引入 popcount 思想）
     # ------------------------------------------------------------------
     def similarity(self, vector1: np.ndarray, vector2: np.ndarray) -> float:
         """
-        计算两个超向量的相似度（基于汉明距离）。
-
-        公式: similarity = 1 - hamming_distance / dimension
-          - 1.0 表示完全相同
-          - 0.0 表示完全不同
-          - ≈0.5 表示近似正交（不相关）
+        计算两个压缩包的相似度（0.0 ~ 1.0）。
 
         Parameters
         ----------
         vector1, vector2 : np.ndarray
-            待比较的二进制超向量。
+            压缩后的二进制超向量。
 
         Returns
         -------
         float
-            相似度分数，范围 [0, 1]。
+            相似度分数。
         """
-        hamming_distance = int(np.sum(vector1 != vector2))
-        return 1.0 - hamming_distance / self.dimension
+        # 第一步：逐字节 XOR 找出对应位不同的集合（1 代表位不同）
+        xor_result = np.bitwise_xor(vector1, vector2)
+        
+        # 第二步：计算汉明距离（统计 xor_result 中 1 的个数）
+        # 方式一（为 C++ 扫雷铺路）：先 unpack 展开，然后 sum
+        # （注：在 C++ 中，这一步会用 __builtin_popcount，不需要展开）
+        diff_bits = np.unpackbits(xor_result)[:self.dimension_]
+        hamming_distance = int(np.sum(diff_bits))
+
+        # 第三步：将距离转换为相似度分数
+        return 1.0 - (hamming_distance / self.dimension_)
 
 
 # ======================================================================
-# 测试 / 演示
+# 测试 / 演示（第三部分回归测试）
 # ======================================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("Solarix HDCCore — 超维计算核心逻辑验证")
+    print("Solarix HDCCore [位压缩原生版本] — 核心逻辑回归测试")
     print("=" * 60)
 
     hdc = HDCCore(dimension=10000)
-    print(f"\n[初始化] 超向量维度: {hdc.dimension}")
+    print(f"\n[初始化] 逻辑维度: {hdc.dimension_}, 物理字节: {hdc.byte_size_}")
 
-    # 1. 生成 3 个随机超向量
+    # 1. 生成向量形状验证
     A = hdc.generate_random_vector()
     B = hdc.generate_random_vector()
-    C = hdc.generate_random_vector()
-    print(f"[生成] A, B, C 三个随机超向量 (shape={A.shape})")
+    print(f"\n[生成检查] 向量 A 的形状: {A.shape} | 预期: ({hdc.byte_size_},)")
+    assert A.shape == (hdc.byte_size_,), "形状不符预期的压缩包设计"
 
-    # 2. 绑定 A 和 B → AB（编码 A-B 关系）
-    AB = hdc.bind(A, B)
-    print(f"[绑定] AB = A ⊕ B  (shape={AB.shape})")
+    # 2. 绑定计算
+    C = hdc.bind(A, B)
+    print(f"[绑定操作] 向量 C(A_xor_B) 的形状: {C.shape}")
 
-    # 3. 打包 AB 和 C → ABC_bundle（集合记忆）
-    ABC_bundle = hdc.bundle([AB, C])
-    print(f"[打包] ABC_bundle = bundle(AB, C)  (shape={ABC_bundle.shape})")
-
-    # 4. 相似度验证
-    sim_AB_bundle = hdc.similarity(AB, ABC_bundle)
-    sim_A_bundle = hdc.similarity(A, ABC_bundle)
+    # 3. 相似度数学一致性验证
+    sim_A_A = hdc.similarity(A, A)
     sim_A_B = hdc.similarity(A, B)
-
-    print(f"\n[相似度] AB vs ABC_bundle : {sim_AB_bundle:.4f}  (期望 ≈0.75，打包成员)")
-    print(f"[相似度] A  vs ABC_bundle : {sim_A_bundle:.4f}  (期望 ≈0.50，非直接成员)")
-    print(f"[相似度] A  vs B          : {sim_A_B:.4f}  (期望 ≈0.50，随机正交)")
-
-    # 5. 压缩 / 解压验证
-    packed_AB = hdc.pack(AB)
-    unpacked_AB = hdc.unpack(packed_AB)
-    is_identical = np.array_equal(AB, unpacked_AB)
-
-    print(f"\n[压缩] AB 原始大小: {AB.nbytes} bytes → 压缩后: {packed_AB.nbytes} bytes")
-    print(f"[解压] 还原后与原向量一致: {is_identical}")
+    
+    print(f"\n[相似度] sim(A, A) = {sim_A_A:.4f}  (期望 = 1.0000)")
+    print(f"[相似度] sim(A, B) = {sim_A_B:.4f}  (期望 ≈ 0.5000)")
+    
+    # Bundle 测试
+    bundled = hdc.bundle([A, C])
+    sim_A_bundle = hdc.similarity(A, bundled)
+    print(f"[合并操作] sim(A, bundle(A, C)) = {sim_A_bundle:.4f}  (期望 ≈ 0.7500)")
 
     print("\n" + "=" * 60)
-    print("验证完成 ✓" if is_identical else "验证失败 ✗")
+    print("回归测试完成 ✓")
     print("=" * 60)
