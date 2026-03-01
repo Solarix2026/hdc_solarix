@@ -56,7 +56,7 @@ class LSHMapper:
             float_vector: 形状 (input_dim,) 的一维浮点向量。
 
         Returns:
-            形状 (output_dim,) 的二进制超向量，dtype 为 np.uint8。
+            位压缩后的数组，形状为 (output_dim // 8,)，dtype 为 np.uint8。
 
         Raises:
             ValueError: 输入向量维度与 input_dim 不匹配时抛出。
@@ -68,7 +68,8 @@ class LSHMapper:
 
         projected = float_vector @ self.projection_matrix  # (output_dim,)
         binary = (projected > 0).astype(np.uint8)
-        return binary
+        packed_binary = np.packbits(binary)
+        return packed_binary
 
 
 if __name__ == "__main__":
@@ -86,10 +87,12 @@ if __name__ == "__main__":
 
     hv = mapper.map(fake_embedding)
 
-    ones_ratio = hv.sum() / hv.size * 100
+    # 为了计算 1 的占比，需要先将其解包
+    unpacked_hv = np.unpackbits(hv)[:mapper.output_dim]
+    ones_ratio = unpacked_hv.sum() / unpacked_hv.size * 100
 
-    print(f"\n[映射结果] 超向量形状: {hv.shape}")
-    print(f"[映射结果] 前 10 个值: {hv[:10]}")
+    print(f"\n[映射结果] 超向量(压缩包)形状: {hv.shape}")
+    print(f"[映射结果] 前 10 个字节值: {hv[:10]}")
     print(f"[映射结果] 1 的占比: {ones_ratio:.2f}%")
     print(f"[映射结果] dtype: {hv.dtype}")
 
