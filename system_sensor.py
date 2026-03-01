@@ -1,7 +1,7 @@
 # C++ Future: This layer stays in Python. It's all about OS APIs, not math.
 """
 Solarix — 全天候感知层 (System Sensor)
-持续监控用户的操作（键盘输入、活动窗口），并在特定周期将其转化为超维记忆存入底层的MemoryVault。
+持续监控用户的操作（键盘输入、活动窗口），并在上下文切换或特定事件发生时将其转化为超维记忆存入底层的MemoryVault。
 """
 
 from __future__ import annotations
@@ -17,18 +17,8 @@ from lsh_mapper import LSHMapper
 from qwen_embedder import get_embedding
 
 
-def get_active_window_title() -> str:
-    """获取当前处于前台焦点的活动窗口的标题"""
-    try:
-        hwnd = win32gui.GetForegroundWindow()
-        title = win32gui.GetWindowText(hwnd)
-        return title if title else "Unknown Window"
-    except Exception:
-        return "Unknown Window"
-
-
 class SystemSensor:
-    """全天候感知器，监听用户上下文操作并定期存入知识库。"""
+    """全天候感知器，基于事件驱动和上下文切换监听用户操作并存入知识库。"""
 
     def __init__(self, vault: MemoryVault, buffer_size: int = 500):
         """
@@ -48,9 +38,28 @@ class SystemSensor:
         # 预先拉起 LSHMapper
         self.mapper = LSHMapper(input_dim=896, output_dim=10000, seed=42)
         
+        # 状态机：跟踪窗口切换
+        self.current_window = self._get_active_window_title()
+        self.previous_window = None
+        
         # 定义并初始化键盘监听器
         self.listener = keyboard.Listener(on_press=self._on_press)
         self.is_running = False
+
+    def _get_active_window_title(self) -> str:
+        """获取当前处于前台焦点的活动窗口的标题"""
+        try:
+            hwnd = win32gui.GetForegroundWindow()
+            title = win32gui.GetWindowText(hwnd)
+            return title if title else "Unknown Window"
+        except Exception:
+            return "Unknown Window"
+
+    def _is_sensitive_window(self, title: str) -> bool:
+        """启发式过滤：判断当前窗口标题是否包含敏感词汇（密码、登录等）。"""
+        sensitive_keywords = ["login", "sign in", "password", "银行", "登录", "支付宝", "密码"]
+        title_lower = title.lower()
+        return any(keyword in title_lower for keyword in sensitive_keywords)
 
     def _on_press(self, key):
         """处理键盘按下事件的回调"""
@@ -72,13 +81,21 @@ class SystemSensor:
         if not self.buffer:
             return
 
-        # 锁定当前缓冲区内容并清空原始 deque（提取出来作为本次快照）
-        key_buffer_str = "".join(self.buffer)
+        # 获取在打字过程中的目标窗口名 (即产生这段敲击动作原本所在的上下文窗口)
+        window_title = self.current_window
+
+        # 检查是否为敏感窗口（登录/网银等），若是，强制掩码替代，防止记录密码或敏感信息
+        if self._is_sensitive_window(window_title):
+            key_buffer_str = "<SENSITIVE_CONTENT_FILTERED>"
+        else:
+            # 锁定当前缓冲区内容并将其提取出来作为本次快照
+            key_buffer_str = "".join(self.buffer)
+        
+        # 无论有没有读取，最终清空内部键盘缓冲区留给新窗口
         self.buffer.clear()
 
         # 生成感知元数据
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        window_title = get_active_window_title()
 
         perception_text = f"[{timestamp}] Window: {window_title}\nTyped: {key_buffer_str}"
 
@@ -87,25 +104,41 @@ class SystemSensor:
 
         # 写入数字海马体
         inserted_id = self.vault.add_memory(perception_text, hv, source="system_sensor")
-        print(f"\n[Sensor] 记忆已存档 (ID={inserted_id}) - 前台窗口源: {window_title[:20]}...")
+        print(f"\n[Sensor] 记忆已存档 (ID={inserted_id}) - 前台窗口源: {window_title[:40]}...")
 
-    def start(self, interval_seconds: float = 300.0):
+    def start(self):
         """
-        开启感知守护循环。
+        开启基于事件(窗口级切换)的感知守护循环。
         """
         self.is_running = True
         self.listener.start()
         
+        print(f"[*] 初始焦点窗口: {self.current_window[:40]}...")
+        
         try:
             while self.is_running:
-                # 采用小分片 sleep 以便能够更快响应 KeyboardInterrupt (Ctrl+C)
-                # 这样不会因为一个死长的 300 秒而陷入锁死状态
-                for _ in range(int(interval_seconds)):
-                    time.sleep(1)
+                # 快速轮询以降低延迟且节省 CPU 空转
+                time.sleep(0.1)
                 
-                # 时间到，执行一次采样抓取
-                self._sample_and_save()
-                
+                # 获取最新的前台焦点窗口
+                new_window = self._get_active_window_title()
+
+                # 判断上下文是否发生了漂移
+                if new_window != self.current_window:
+                    # 发现存在切换（例如从 VS Code 切到了 Chrome）
+                    
+                    # 1. 马上结算并保存这离开之前的上个窗口的动作记忆
+                    self._sample_and_save()
+                    
+                    # 2. 从严控盘：不管 _sample_and_save 中是否省电 return，强行清空残留输入避免越界污染
+                    self.buffer.clear()
+                    
+                    # 3. 推进状态机
+                    self.previous_window = self.current_window
+                    self.current_window = new_window
+                    
+                    print(f"[Context Shift] {self.previous_window[:30]} -> {self.current_window[:30]}")
+                    
         except KeyboardInterrupt:
             # 监听到 Ctrl+C
             self.stop()
@@ -137,7 +170,7 @@ if __name__ == "__main__":
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
     print("=" * 60)
-    print("准备启动 Solarix 全天候系统感知层 ...")
+    print("准备启动 Solarix 全天候系统感知层 (事件驱动版) ...")
     print("=" * 60)
 
     # 1. 挂载持久化组件
@@ -147,13 +180,12 @@ if __name__ == "__main__":
     # 2. 挂载感知器层
     sensor = SystemSensor(vault=vault, buffer_size=500)
     
-    print("Solarix 感知器已启动，正在记录您的操作... (按 Ctrl+C 停止)")
-    print("提示: 默认时间循环设定在 300秒。我们在真实场景下后台运行。")
-    print("(等待输入及时间轮训...)")
+    print("Solarix 感知器已启动，正在监听您的窗口切换及键盘敲击... (按 Ctrl+C 停止)")
+    print("提示：请尝试在当前窗口打字，然后切换到另一个窗口（如浏览器或记事本），观察控制台上下文重定！")
+    print("-" * 60)
     
     try:
-        # 这里为测试设置了真实的 300 秒轮询（若你想加快触发可以手动在这里调参，例如 interval_seconds=10）
-        sensor.start(interval_seconds=300)
+        sensor.start()
     except KeyboardInterrupt:
         pass
     finally:
