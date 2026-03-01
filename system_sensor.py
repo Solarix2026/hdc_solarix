@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import time
 import win32gui
+import threading
+import queue
 from collections import deque
 from datetime import datetime
 from pynput import keyboard
@@ -18,7 +20,7 @@ from qwen_embedder import get_embedding
 
 
 class SystemSensor:
-    """全天候感知器，基于事件驱动和上下文切换监听用户操作并存入知识库。"""
+    """全天候感知器，基于事件驱动、拦截器与后台异步计算监听用户操作并存入知识库。"""
 
     def __init__(self, vault: MemoryVault, buffer_size: int = 500):
         """
@@ -35,16 +37,22 @@ class SystemSensor:
         # 使用 deque 的 maxlen 特性，一旦达到上限自动从另一端淘汰旧数据 (FIFO)
         self.buffer = deque(maxlen=buffer_size) 
         
-        # 预先拉起 LSHMapper
+        # 预先拉起 LSHMapper (将在后台线程调用)
         self.mapper = LSHMapper(input_dim=896, output_dim=10000, seed=42)
         
         # 状态机：跟踪窗口切换
         self.current_window = self._get_active_window_title()
         self.previous_window = None
         
-        # 定义并初始化键盘监听器
-        self.listener = keyboard.Listener(on_press=self._on_press)
+        # 生产者 - 消费者 异步队列设置
+        self.task_queue = queue.Queue()
         self.is_running = False
+        
+        # 启动后台消费者线程
+        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        
+        # 定义并初始化键盘监听器 (生产者)
+        self.listener = keyboard.Listener(on_press=self._on_press)
 
     def _get_active_window_title(self) -> str:
         """获取当前处于前台焦点的活动窗口的标题"""
@@ -67,16 +75,21 @@ class SystemSensor:
             # 记录常规字符 (过滤掉修饰键如 Ctrl, Shift 等无 char 属性的内容)
             if hasattr(key, 'char') and key.char is not None:
                 self.buffer.append(key.char)
-            # 对常见的空白控制字符进行可读性保留
+            # 处理退格键 (Backspace): 如果缓冲区有内容，则弹掉最后一个字符
+            elif key == keyboard.Key.backspace:
+                if self.buffer:
+                    self.buffer.pop()
+            # 常见的空白控制字符进行可读性保留
             elif key == keyboard.Key.space:
                 self.buffer.append(' ')
             elif key == keyboard.Key.enter:
                 self.buffer.append('\n')
+            # 对于删除键 (Delete)，因为目前缺乏光标感知概念，故暂时放行忽略不记
         except Exception:
             pass
 
     def _sample_and_save(self):
-        """执行一次感知采样、超维哈希并写入记忆库"""
+        """主线程(生产者) 调用：仅提取上下文与打字内容并推入队列，绝不包含重型运算阻塞主循环"""
         # 如果缓冲区为空，直接跳过以省电
         if not self.buffer:
             return
@@ -93,24 +106,46 @@ class SystemSensor:
         
         # 无论有没有读取，最终清空内部键盘缓冲区留给新窗口
         self.buffer.clear()
-
-        # 生成感知元数据
+        
+        # 将结构化原始数据推入消费队列
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.task_queue.put((timestamp, window_title, key_buffer_str))
 
-        perception_text = f"[{timestamp}] Window: {window_title}\nTyped: {key_buffer_str}"
-
-        # Embedding 和 LSH 降维映射
-        hv = self.mapper.map(get_embedding(perception_text))
-
-        # 写入数字海马体
-        inserted_id = self.vault.add_memory(perception_text, hv, source="system_sensor")
-        print(f"\n[Sensor] 记忆已存档 (ID={inserted_id}) - 前台窗口源: {window_title[:40]}...")
+    def _worker_loop(self):
+        """后台线程(消费者)：负责执行 Qwen Embedding 及 HDC 计算和入库操作"""
+        while self.is_running:
+            try:
+                # 获取任务（设置 timeout 让线程能定期醒来检查 is_running 标志以便安全退出）
+                task = self.task_queue.get(timeout=1)
+                
+                # 解包获取上下文
+                timestamp, window_title, key_buffer_str = task
+                perception_text = f"[{timestamp}] Window: {window_title}\nTyped: {key_buffer_str}"
+                
+                # 这部分包含重型神经网络和哈希降维推演 (耗时操作放在后台执行，解耦 UI 及钩子侦听延迟)
+                hv = self.mapper.map(get_embedding(perception_text))
+                
+                # 写入数字海马体
+                inserted_id = self.vault.add_memory(perception_text, hv, source="system_sensor")
+                print(f"\n[Worker] 记忆已异步存档 (ID={inserted_id}) - 前台窗口源: {window_title[:40]}...")
+                
+                # 标记该任务为完成
+                self.task_queue.task_done()
+                
+            except queue.Empty:
+                # 队列空属于正常情况，直接在新循环中继续等待
+                continue
+            except Exception as e:
+                print(f"\n[Worker] 出错，无法执行入库操作: {e}")
 
     def start(self):
         """
         开启基于事件(窗口级切换)的感知守护循环。
         """
         self.is_running = True
+        # 拉起后台消费者线程
+        self.worker_thread.start()
+        # 拉起键盘拦截器
         self.listener.start()
         
         print(f"[*] 初始焦点窗口: {self.current_window[:40]}...")

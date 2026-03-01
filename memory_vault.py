@@ -23,7 +23,7 @@ class MemoryVault:
             SQLite 数据库文件的路径，默认为 'solarix_memory.db'。
         """
         self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._create_tables()
 
     def _create_tables(self) -> None:
