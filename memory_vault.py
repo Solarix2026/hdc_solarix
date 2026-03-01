@@ -40,7 +40,7 @@ class MemoryVault:
         """)
         self.conn.commit()
 
-    def add_memory(self, text: str, hypervector: np.ndarray, source: str = "manual") -> int:
+    def add_memory(self, text: str, hypervector: np.ndarray, source: str = "manual", timestamp_unix: float = None) -> int:
         """
         将文本及其对应的位压缩超向量存入数据库。
 
@@ -52,19 +52,31 @@ class MemoryVault:
             对应的超向量（位压缩格式，dtype=uint8）。
         source : str
             记忆来源标签。
+        timestamp_unix: float
+            外部触发该记忆的精确Unix时间戳。如果为空，则使用当前时间。
 
         Returns
         -------
         int
             新插入记录的数据库自增 ID。
         """
+        import datetime
+        import time
+        if timestamp_unix is None:
+            timestamp_unix = time.time()
+            
+        dt = datetime.datetime.fromtimestamp(timestamp_unix)
+        timestamp_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            
         # 将 numpy 数组转为原生 bytes 存入 SQLite BLOB
         hv_bytes = hypervector.tobytes()
         
+        print(f"[Vault] 正在存入记忆，时间戳: {timestamp_str}")
+        
         cursor = self.conn.cursor()
         cursor.execute(
-            "INSERT INTO memories (original_text, hypervector, source) VALUES (?, ?, ?)",
-            (text, hv_bytes, source)
+            "INSERT INTO memories (timestamp, original_text, hypervector, source) VALUES (?, ?, ?, ?)",
+            (timestamp_str, text, hv_bytes, source)
         )
         self.conn.commit()
         

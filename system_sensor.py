@@ -51,11 +51,14 @@ class SystemSensor:
         
         # 时间与指标追踪 (统一使用 Unix time float)
         self.window_start_time = time.time()
-        self.keystroke_count = 0
         
-        # 休息与状态干预的打点控制
-        self.last_break_time = time.time()
+        # 滑动窗口：记录最近有效击键的绝对时间戳
+        self.keystroke_timestamps = deque()
+        
+        # 休息与状态干预的打点控制 (双轨制干预核心)
+        self.last_intervention_time = time.time()
         self.last_state_eval_time = time.time()
+        self.deep_work_start_time = None
         
         # 生产者 - 消费者 异步队列设置
         self.task_queue = queue.Queue()
@@ -82,13 +85,25 @@ class SystemSensor:
         title_lower = title.lower()
         return any(keyword in title_lower for keyword in sensitive_keywords)
 
+    def _get_recent_keystrokes(self) -> int:
+        """
+        计算最近60秒的击键数（滑动窗口的核心防抖逻辑）
+        这使得“每分钟敲击数”变成了真实的瞬时速率，而非长时间挂机的被平均数。
+        """
+        current_time = time.time()
+        # 清理60秒前的过期时间戳（维护实时窗口）
+        while self.keystroke_timestamps and self.keystroke_timestamps[0] < current_time - 60:
+            self.keystroke_timestamps.popleft()
+            
+        return len(self.keystroke_timestamps)
+
     def _on_press(self, key):
         """处理键盘按下事件的回调"""
         try:
             # 记录常规字符 (过滤掉修饰键如 Ctrl, Shift 等无 char 属性的内容)
             if hasattr(key, 'char') and key.char is not None:
                 self.buffer.append(key.char)
-                self.keystroke_count += 1
+                self.keystroke_timestamps.append(time.time())
             # 处理退格键 (Backspace): 如果缓冲区有内容，则弹掉最后一个字符
             elif key == keyboard.Key.backspace:
                 if self.buffer:
@@ -96,10 +111,10 @@ class SystemSensor:
             # 常见的空白控制字符进行可读性保留
             elif key == keyboard.Key.space:
                 self.buffer.append(' ')
-                self.keystroke_count += 1
+                self.keystroke_timestamps.append(time.time())
             elif key == keyboard.Key.enter:
                 self.buffer.append('\n')
-                self.keystroke_count += 1
+                self.keystroke_timestamps.append(time.time())
             # 对于删除键 (Delete)，因为目前缺乏光标感知概念，故暂时放行忽略不记
         except Exception:
             pass
@@ -113,19 +128,17 @@ class SystemSensor:
         if not self.buffer and not force:
             # 即使跳过，由于窗口也在切换，因此重置计算起始状态以服务于下个空窗口
             self.window_start_time = time.time()
-            self.keystroke_count = 0
             return
             
         current_time = time.time()
         dwell_time_seconds = current_time - self.window_start_time
         
-        # 捕捉当前的敲击计数值并缓存一份
-        strokes = self.keystroke_count
+        # 获取当前最真实的极瞬时敲击频率
+        real_keystrokes_1min = self._get_recent_keystrokes()
         
         # 如果是窗口切换（非强制评估），则重置状态机为新窗口做准备
         if not force:
             self.window_start_time = current_time
-            self.keystroke_count = 0
 
         # 获取在打字过程中的目标窗口名
         window_title = self.current_window
@@ -138,11 +151,12 @@ class SystemSensor:
             key_buffer_str = "".join(self.buffer)
         
         # 如果是窗口切换，清空内部键盘缓冲区留给新窗口
+        # 注: 不清空 keystroke_timestamps，因为它是一个全局的时间滑轨，不随窗口销毁
         if not force:
             self.buffer.clear()
         
-        # 将结构化原始数据推入消费队列 (包含 is_force_eval 标志，传达最后一位)
-        self.task_queue.put((current_time, window_title, key_buffer_str, strokes, dwell_time_seconds, force))
+        # 将结构化原始数据推入消费队列
+        self.task_queue.put((current_time, window_title, key_buffer_str, real_keystrokes_1min, dwell_time_seconds, force))
 
 
     def _worker_loop(self):
@@ -153,39 +167,60 @@ class SystemSensor:
                 task = self.task_queue.get(timeout=1)
                 
                 # 解包获取上下文
-                current_time, window_title, key_buffer_str, strokes, dwell_time_seconds, is_force_eval = task
+                current_time, window_title, key_buffer_str, keystrokes_1min, dwell_time_seconds, is_force_eval = task
                 
                 # -------------------------------------------------------------
-                # 模块一：认知量化与主动干预 (Perceptor Layer)
+                # 模块一：认知量化与主动干预 (Perceptor Layer: 双轨制)
                 # -------------------------------------------------------------
-                # 防止除零错误，将击键转换为次/分钟的概念
-                keystrokes_1min = (strokes / max(dwell_time_seconds, 1e-6)) * 60.0
+                # 获取系统级量化状态
                 state_vector = self.perceptor.get_state_vector(window_title, keystrokes_1min, dwell_time_seconds)
                 state_desc = self.perceptor.get_state_description(state_vector)
+                print(f"[Perceptor] 认知状态: {state_desc} [近期实测 {keystrokes_1min} 键/分]")
                 
-                print(f"\n[Perceptor] 认知状态: {state_desc}")
+                time_since_last_intervention = current_time - self.last_intervention_time
                 
-                time_since_last_break = current_time - self.last_break_time
+                # ------ 判定深工潜能与溯源 ------
+                if state_vector['window_category'] == "WORK" and keystrokes_1min > 200 and self.deep_work_start_time is None:
+                    self.deep_work_start_time = current_time
+                    print("[Solarix] 监测到进入高并发模式，启动心流记录...")
+                    
+                # 判定深度工作：工作类别 + 高频键入 + 停留在其应用极其漫长的总驻扎或者自身整体时长
+                # （使用当前时间与刚立起来的起始时间作对比，看他到底肝了多久）
+                is_deep_work = False
+                if self.deep_work_start_time is not None:
+                    deep_duration = current_time - self.deep_work_start_time
+                    if state_vector['window_category'] == "WORK" and keystrokes_1min > 200 and deep_duration > 5400: # 90 分钟
+                        is_deep_work = True
                 
-                # 基础干预触发条件: 我们设定为娱乐中，或者工作低频状态（比如走神）
-                is_entertainment_or_idle = (state_vector['window_category'] == "ENTERTAINMENT" or 
-                                           state_vector['activity_intensity'] == "LOW")
-                
-                # 为方便测试，这里设定阈值为 60 秒 (真实环境应是 3600 秒)
-                if is_entertainment_or_idle and time_since_last_break > 60:
-                    # 预案 2：打扰成本评估
-                    if keystrokes_1min < 10:
-                        print("[Perceptor] 检测到放松状态，但用户可能在专注观看内容 (视频等)，无活跃操作，暂缓干预。")
-                        self.last_break_time += 600  # 顺延 10 分钟 (实际测试中也可以降低点)
-                    else:
-                        print("[Perceptor] 执行系统级硬干预弹窗！")
-                        notification.notify(
-                            title="Solarix 注意力干预",
-                            message="检测到你正在无意义消耗，且已持续运行一段时间。立刻站起来喝水休息。",
-                            app_name="Solarix",
-                            timeout=10
-                        )
-                        self.last_break_time = time.time()
+                # 摸鱼或心流走神断崖判定
+                is_idle_entertainment = (
+                    state_vector['window_category'] == "ENTERTAINMENT" 
+                    or (state_vector['window_category'] == "WORK" and keystrokes_1min < 50)
+                )
+
+                # ------ 轨道 1：摸鱼 / 发呆防沉迷干预 (为快测可改成 60s) ------
+                if is_idle_entertainment and time_since_last_intervention > 60: # 正式版: 2700 (45分钟)
+                    notification.notify(
+                        title="Solarix · 健康提醒",
+                        message="检测到你已无意义消耗或者注意力涣散！立刻站起来活动，别浪费生命。",
+                        app_name="Solarix",
+                        timeout=10
+                    )
+                    self.last_intervention_time = current_time
+                    # 一旦触发该轨道，意味着心流已崩盘，清理深度工作锚点
+                    self.deep_work_start_time = None
+
+                # ------ 轨道 2：深度工作过劳干预防线 (为快测可改成 90s) ------
+                # 只有在高强度打代码时才会触发
+                if is_deep_work and time_since_last_intervention > 90: # 正式版: 5400 (90分钟)
+                    notification.notify(
+                        title="Solarix · 强制休息预警",
+                        message="警告：你已高强度工作进入红区！系统将建议立刻休眠，保护颈椎和视力！",
+                        app_name="Solarix",
+                        timeout=15
+                    )
+                    self.last_intervention_time = current_time
+                    self.deep_work_start_time = None  # 提醒后打断过劳连续状态
                 
                 # -------------------------------------------------------------
                 # 模块二：数据持久化 (HDC Memory Vault)
@@ -195,14 +230,19 @@ class SystemSensor:
                 
                 # 对于强制性定时评估拉取的数据不再存入废弃库中占用空间，只更新状态，切屏瞬间才有价值存下。
                 if not is_force_eval and key_buffer_str.strip():
-                    perception_text = f"[{timestamp_str}] Window: {window_title} (Dwell: {dwell_time_seconds:.1f}s, Keystrokes: {strokes})\nTyped: {key_buffer_str}"
+                    perception_text = f"[{timestamp_str}] Window: {window_title} (Dwell: {dwell_time_seconds:.1f}s, Keystrokes: {keystrokes_1min})\nTyped: {key_buffer_str}"
                     
                     # 这部分包含重型神经网络和哈希降维推演 (耗时操作放在后台执行)
                     hv = self.mapper.map(get_embedding(perception_text))
                     
                     # 写入数字海马体
-                    inserted_id = self.vault.add_memory(perception_text, hv, source="system_sensor")
-                    print(f"[Worker] 记忆异步存档 (ID={inserted_id}) - {window_title[:20]}... [驻留 {dwell_time_seconds:.1f}s | {strokes} 键]")
+                    inserted_id = self.vault.add_memory(
+                        perception_text, 
+                        hv, 
+                        source="system_sensor", 
+                        timestamp_unix=current_time
+                    )
+                    print(f"[Worker] 记忆异步存档 (ID={inserted_id}) - {window_title[:20]}... [驻留 {dwell_time_seconds:.1f}s | 实键 {keystrokes_1min} 次/分]")
                 
                 # 标记该任务为完成
                 self.task_queue.task_done()
