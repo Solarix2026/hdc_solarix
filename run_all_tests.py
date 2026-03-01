@@ -54,6 +54,9 @@ def run_test(step: int, total: int, name: str, script: str):
             if "状态健康" not in stdout_str and "警告" not in stdout_str and "HEALTHY" not in stdout_str and "WARNING" not in stdout_str:
                 print("❌ TEST FAILED: Stage 3 中未检测到有关相似度拥挤状态的诊断信息")
                 sys.exit(1)
+        elif script == "memory_vault.py" and "验证完成 ✓" not in stdout_str:
+            print("❌ TEST FAILED: memory_vault.py 中未检测到 '验证完成 ✓'")
+            sys.exit(1)
                 
     except Exception as e:
         print(f"❌ TEST FAILED: 执行异常 - {e}")
@@ -66,7 +69,8 @@ if __name__ == "__main__":
     tests = [
         ("HDCCore", "hdc_core.py"),
         ("LSHMapper", "lsh_mapper.py"),
-        ("Stage 3 E2E", "solarix_test_stage3.py")
+        ("Stage 3 E2E", "solarix_test_stage3.py"),
+        ("MemoryVault", "memory_vault.py")
     ]
     
     total = len(tests)
