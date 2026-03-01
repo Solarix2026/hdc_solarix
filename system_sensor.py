@@ -62,6 +62,9 @@ class SystemSensor:
         
         # 生产者 - 消费者 异步队列设置
         self.task_queue = queue.Queue()
+        
+        # UI 弹窗队列：由 Worker 计算触发，交还主线程安全执行
+        self.notification_queue = queue.Queue()
         self.is_running = False
         
         # 启动后台消费者线程
@@ -179,48 +182,63 @@ class SystemSensor:
                 
                 time_since_last_intervention = current_time - self.last_intervention_time
                 
-                # ------ 判定深工潜能与溯源 ------
-                if state_vector['window_category'] == "WORK" and keystrokes_1min > 200 and self.deep_work_start_time is None:
-                    self.deep_work_start_time = current_time
-                    print("[Solarix] 监测到进入高并发模式，启动心流记录...")
+                # ------ 轨道与状态追踪更新 ------
+                # 摸鱼轨道 1：纯娱乐窗口
+                is_entertainment = state_vector['window_category'] == "ENTERTAINMENT"
+                
+                # 摸鱼轨道 2：工作窗口真发呆（盯代码超 10 分钟 + 最近一分钟只敲不到 5 个字）
+                is_work_idle = (state_vector['window_category'] == "WORK" 
+                                and dwell_time_seconds > 600 
+                                and keystrokes_1min < 5)
+                                
+                # 深度锚点保护与初始化逻辑：
+                # 只要是在工作类环境且不是长时发呆，我们就认作有效的心流存续期（兼容正常的思考停顿不丢锚点）
+                if state_vector['window_category'] == "WORK":
+                    if not is_work_idle:
+                        if self.deep_work_start_time is None:
+                            self.deep_work_start_time = current_time
+                            print("[Solarix] 监测到进入工作模式，启动心流防过劳锚点...")
+                else:
+                    # 一旦切入其它非工作类别，直接破功掉前面的深度心流累积
+                    self.deep_work_start_time = None
                     
-                # 判定深度工作：工作类别 + 高频键入 + 停留在其应用极其漫长的总驻扎或者自身整体时长
-                # （使用当前时间与刚立起来的起始时间作对比，看他到底肝了多久）
+                # 计算深工时长 (如果处于深工周期内)
                 is_deep_work = False
                 if self.deep_work_start_time is not None:
                     deep_duration = current_time - self.deep_work_start_time
-                    if state_vector['window_category'] == "WORK" and keystrokes_1min > 200 and deep_duration > 5400: # 90 分钟
+                    # 90 分钟极度危险期定义：且当下打字频率极高（即仍在疯狂输出而非休息态）
+                    if deep_duration > 5400 and keystrokes_1min > 200:
                         is_deep_work = True
-                
-                # 摸鱼或心流走神断崖判定
-                is_idle_entertainment = (
-                    state_vector['window_category'] == "ENTERTAINMENT" 
-                    or (state_vector['window_category'] == "WORK" and keystrokes_1min < 50)
-                )
 
-                # ------ 轨道 1：摸鱼 / 发呆防沉迷干预 (为快测可改成 60s) ------
-                if is_idle_entertainment and time_since_last_intervention > 60: # 正式版: 2700 (45分钟)
-                    notification.notify(
-                        title="Solarix · 健康提醒",
-                        message="检测到你已无意义消耗或者注意力涣散！立刻站起来活动，别浪费生命。",
-                        app_name="Solarix",
-                        timeout=10
-                    )
+                # ------ 轨道执行：子线程不干预 UI，只推送进通知队列 ------
+                # 发呆类通报
+                if is_entertainment and time_since_last_intervention > 2700: # 45 分钟
+                    self.notification_queue.put({
+                        "title": "Solarix · 健康提醒",
+                        "message": "检测到你已娱乐/放松了很长时间！起身活动一下吧～",
+                        "timeout": 10
+                    })
                     self.last_intervention_time = current_time
-                    # 一旦触发该轨道，意味着心流已崩盘，清理深度工作锚点
+                    self.deep_work_start_time = None
+                    
+                elif is_work_idle and time_since_last_intervention > 1800: # 工作发呆超 30 分钟预警
+                    self.notification_queue.put({
+                        "title": "Solarix · 编程思考提醒",
+                        "message": "检测到你盯代码很久未操作～是否卡壳了？起身喝口水再重回思路吧！",
+                        "timeout": 10
+                    })
+                    self.last_intervention_time = current_time
                     self.deep_work_start_time = None
 
-                # ------ 轨道 2：深度工作过劳干预防线 (为快测可改成 90s) ------
-                # 只有在高强度打代码时才会触发
-                if is_deep_work and time_since_last_intervention > 90: # 正式版: 5400 (90分钟)
-                    notification.notify(
-                        title="Solarix · 强制休息预警",
-                        message="警告：你已高强度工作进入红区！系统将建议立刻休眠，保护颈椎和视力！",
-                        app_name="Solarix",
-                        timeout=15
-                    )
+                # 过劳轨预警
+                if is_deep_work and time_since_last_intervention > 5400: # 90 分钟高优级拦截
+                    self.notification_queue.put({
+                        "title": "Solarix · 强制休息预警",
+                        "message": "警告：你已高强度心流工作进入红区！系统建议立刻休眠屏幕，保护颈椎与视力！",
+                        "timeout": 15
+                    })
                     self.last_intervention_time = current_time
-                    self.deep_work_start_time = None  # 提醒后打断过劳连续状态
+                    self.deep_work_start_time = None
                 
                 # -------------------------------------------------------------
                 # 模块二：数据持久化 (HDC Memory Vault)
@@ -266,6 +284,19 @@ class SystemSensor:
         
         try:
             while self.is_running:
+                # 只在当前主频上安全弹出通知
+                try:
+                    toast = self.notification_queue.get_nowait()
+                    notification.notify(
+                        title=toast.get("title", "系统提示"),
+                        message=toast.get("message", ""),
+                        app_name="Solarix",
+                        timeout=toast.get("timeout", 10)
+                    )
+                    self.notification_queue.task_done()
+                except queue.Empty:
+                    pass
+
                 # 快速轮询以降低延迟且节省 CPU 空转
                 time.sleep(0.1)
                 
